@@ -4,13 +4,16 @@
 #include <stdlib.h>
 #include <stdio.h>
 
+#include <locale.h>  
+#include <conio.h>
+
 #define SERVERPORT 9000
 #define BUFSIZE 512
 
 struct SOCKETINFO {
 	WSAOVERLAPPED overlapped;
 	SOCKET sock;
-	char buf[BUFSIZE + 1];
+	wchar_t buf[BUFSIZE + 1];
 	int recvbytes;
 	int sendbytes;
 	WSABUF wsabuf;
@@ -28,6 +31,8 @@ void RemoveSocketInfo(int nIndex);
 
 int main()
 {
+	_wsetlocale(LC_ALL, L"");  // 시스템 로케일 사용
+
 	int retval;
 	InitializeCriticalSection(&cs);
 
@@ -71,12 +76,12 @@ int main()
 			__debugbreak();
 			break;
 		}
-		printf("\n[TCP 서버] 클라이언트 접속: IP 주소 = %s, 포트 번호 = %d\n", inet_ntoa(clientaddr.sin_addr), ntohs(clientaddr.sin_port));
+		wprintf(L"\n[TCP 서버] 클라이언트 접속: IP 주소 = %S, 포트 번호 = %d\n", inet_ntoa(clientaddr.sin_addr), ntohs(clientaddr.sin_port));
 
 		if (AddSocketInfo(client_sock) == FALSE) {
 
 			closesocket(client_sock);
-			printf("[TCP 서버] 클라이언트 종료: IP 주소 = %s, 포트 번호 =%d\n",
+			wprintf(L"[TCP 서버] 클라이언트 종료: IP 주소 = %S, 포트 번호 =%d\n",
 				inet_ntoa(clientaddr.sin_addr), ntohs(clientaddr.sin_port));
 			continue;
 		}
@@ -124,7 +129,7 @@ DWORD WINAPI WorkerThread(LPVOID arg) {
 		retval = WSAGetOverlappedResult(ptr->sock, &ptr->overlapped, &cbTransferred, FALSE, &flags);
 		if (retval == FALSE || cbTransferred == 0) { // recv  : cbTransferred 0 수신 cbTransferred >0 정상 데이터 수신 
 			RemoveSocketInfo(index);
-			printf("[TCP 서버] 클라이언트 종료 : IP 주소= %s, 포트 번호= %d\n",
+			wprintf(L"[TCP 서버] 클라이언트 종료 : IP 주소= %S, 포트 번호= %d\n",
 				inet_ntoa(clientaddr.sin_addr), ntohs(clientaddr.sin_port));
 			continue;
 		}
@@ -136,8 +141,8 @@ DWORD WINAPI WorkerThread(LPVOID arg) {
 			ptr->recvbytes = cbTransferred;
 			ptr->sendbytes = 0;
 
-			ptr->buf[ptr->recvbytes] = '\0';
-			printf("[TCP/%s:%d] %s\n", inet_ntoa(clientaddr.sin_addr), ntohs(clientaddr.sin_port), ptr->buf);
+			ptr->buf[ptr->recvbytes / sizeof(wchar_t)] = L'\0';
+			wprintf(L"[TCP/%S:%d] %s\n", inet_ntoa(clientaddr.sin_addr), ntohs(clientaddr.sin_port), ptr->buf);
 		}
 		else { // 읽기 바이트가 있으면 이건 송신이 아닌 수신이 성공함.
 			ptr->sendbytes += cbTransferred;
@@ -147,8 +152,8 @@ DWORD WINAPI WorkerThread(LPVOID arg) {
 			// 마저 데이터 보내기 링버퍼로 간단하게 가능할듯함.
 			ZeroMemory(&ptr->overlapped, sizeof(ptr->overlapped)); // 재사용인듯?
 			ptr->overlapped.hEvent = EventArray[index];
-			ptr->wsabuf.buf = ptr->buf + ptr->sendbytes;
-			ptr->wsabuf.len = ptr->recvbytes - ptr->sendbytes;
+			ptr->wsabuf.buf = (char*)ptr->buf + ptr->sendbytes;
+			ptr->wsabuf.len = (ptr->recvbytes - ptr->sendbytes);
 
 
 			DWORD sendbytes;
@@ -168,8 +173,8 @@ DWORD WINAPI WorkerThread(LPVOID arg) {
 			// 데이터 받기
 			ZeroMemory(&ptr->overlapped, sizeof(ptr->overlapped));
 			ptr->overlapped.hEvent = EventArray[index];
-			ptr->wsabuf.buf = ptr->buf;
-			ptr->wsabuf.len = BUFSIZE;
+			ptr->wsabuf.buf = (char*)ptr->buf;
+			ptr->wsabuf.len = BUFSIZE * sizeof(wchar_t);
 
 			DWORD recvbytes;
 			flags = 0;
@@ -200,8 +205,8 @@ BOOL AddSocketInfo(SOCKET sock) {
 	ptr->overlapped.hEvent = hEvent;
 	ptr->sock = sock;
 	ptr->recvbytes = ptr->sendbytes = 0;
-	ptr->wsabuf.buf = ptr->buf;
-	ptr->wsabuf.len = BUFSIZE;
+	ptr->wsabuf.buf = (char*)ptr->buf;
+	ptr->wsabuf.len = BUFSIZE * sizeof(wchar_t);
 	SocketInfoArray[nTotalSockets] = ptr;
 	EventArray[nTotalSockets] = hEvent;
 	++nTotalSockets;
