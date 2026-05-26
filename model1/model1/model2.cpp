@@ -72,6 +72,16 @@ int main()
 			__debugbreak();
 			break;
 		}
+		// 송신버퍼 0 만들기
+		int sndbuf = 0;
+		int ret = setsockopt(client_sock, SOL_SOCKET, SO_SNDBUF,
+			(const char*)&sndbuf, sizeof(sndbuf));
+		if (ret == SOCKET_ERROR)
+		{
+			// WSAGetLastError()로 확인
+			__debugbreak();
+		}
+
 		SetEvent(hWriteEvent);
 	}
 
@@ -117,7 +127,8 @@ DWORD WINAPI WorkerThread(LPVOID arg) {
 		DWORD flags = 0;
 		retval = WSARecv(ptr->sock, &ptr->wsabuf, 1, &recvbytes, &flags, &ptr->overlapped, CompletionRoutine);
 		if (retval == SOCKET_ERROR) {
-			if (WSAGetLastError() != WSA_IO_PENDING) {
+			int temp = WSAGetLastError();
+			if (temp != WSA_IO_PENDING) {
 				__debugbreak();
 				return 1;
 			}
@@ -170,9 +181,10 @@ void CALLBACK CompletionRoutine(
 		ptr->wsabuf.len = ptr->recvbytes - ptr->sendbytes;
 
 		DWORD sendbytes;
-		retval = WSASend(ptr->sock, &ptr->wsabuf, 1, &sendbytes, 0, &ptr->overlapped, CompletionRoutine);
+		retval = WSASend(ptr->sock, &ptr->wsabuf, 1, &sendbytes, 0, &ptr->overlapped, CompletionRoutine); // 0반환해서 즉시 카피 확인, 
 		if (retval == SOCKET_ERROR) {
-			if (WSAGetLastError() != WSA_IO_PENDING) {
+			int temp = WSAGetLastError();
+			if (temp != WSA_IO_PENDING) {
 				__debugbreak();
 				return;
 			}
@@ -188,9 +200,10 @@ void CALLBACK CompletionRoutine(
 
 		DWORD recvbytes;
 		DWORD flags = 0;
-		retval = WSARecv(ptr->sock, &ptr->wsabuf, 1, &recvbytes, &flags, &ptr->overlapped, CompletionRoutine);
+		retval = WSARecv(ptr->sock, &ptr->wsabuf, 1, &recvbytes, &flags, &ptr->overlapped, CompletionRoutine); // -1 반환해서 실패했고, pending 됨을 에러로 확인
 		if (retval == SOCKET_ERROR) {
-			if (WSAGetLastError() != WSA_IO_PENDING) {
+			int temp = WSAGetLastError();
+			if (temp != WSA_IO_PENDING) {
 				__debugbreak();
 				return;
 			}
