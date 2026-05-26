@@ -98,7 +98,7 @@ int main()
 			}
 		}
 
-		WSASetEvent(EventArray[0]); // 소켓 추가 삭제시 워커 스레드 깨우는 용도뱅
+		WSASetEvent(EventArray[0]); // 소켓 추가 삭제시 워커 스레드 깨우는 용도
 
 	}
 
@@ -231,3 +231,5 @@ void RemoveSocketInfo(int nIndex) {
 
 	LeaveCriticalSection(&cs);
 }
+
+// 이벤트 와 완료루틴의 차이는 이벤트는 전역 이벤트라 메인스레드에서 요청이 가능하다는점. 완료루틴같은경우 자기만의 스레드의 apc 큐를 사용하므로 다른 스레드에서 요청을 못한다는점
