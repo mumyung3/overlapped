@@ -8,7 +8,8 @@
 #include <conio.h>
 
 #define SERVERPORT 9000
-#define BUFSIZE 512
+//#define BUFSIZE 512
+#define BUFSIZE (1024 * 1024)   // 1MB (바이트 단위로 생각)
 
 struct SOCKETINFO {
 	WSAOVERLAPPED overlapped;
@@ -17,8 +18,13 @@ struct SOCKETINFO {
 	int recvbytes;
 	int sendbytes;
 	WSABUF wsabuf;
-
+	LARGE_INTEGER sendStart;   // WSASend 직전 QPC
+	BOOL isSend;               // 직전 요청이 send인지 구분
 };
+
+//
+LARGE_INTEGER g_freq;
+
 
 SOCKET client_sock;
 HANDLE hReadEvent, hWriteEvent;
@@ -32,6 +38,8 @@ void CALLBACK CompletionRoutine(
 int main()
 {
 	_wsetlocale(LC_ALL, L"");  // 시스템 로케일 사용
+
+	QueryPerformanceFrequency(&g_freq);   // main 안에서 호출
 
 	int retval;
 
@@ -74,8 +82,7 @@ int main()
 		}
 		// 송신버퍼 0 만들기
 		int sndbuf = 0;
-		int ret = setsockopt(client_sock, SOL_SOCKET, SO_SNDBUF,
-			(const char*)&sndbuf, sizeof(sndbuf));
+		int ret = setsockopt(client_sock, SOL_SOCKET, SO_SNDBUF, (const char*)&sndbuf, sizeof(sndbuf));
 		if (ret == SOCKET_ERROR)
 		{
 			// WSAGetLastError()로 확인
@@ -125,6 +132,7 @@ DWORD WINAPI WorkerThread(LPVOID arg) {
 		// 비동기 입출력 시작
 		DWORD recvbytes;
 		DWORD flags = 0;
+		ptr->isSend = FALSE;
 		retval = WSARecv(ptr->sock, &ptr->wsabuf, 1, &recvbytes, &flags, &ptr->overlapped, CompletionRoutine);
 		if (retval == SOCKET_ERROR) {
 			int temp = WSAGetLastError();
@@ -143,10 +151,19 @@ void CALLBACK CompletionRoutine(
 	DWORD dwError, DWORD cbTransferred,
 	LPWSAOVERLAPPED lpOverlapped, DWORD dwFlags) {
 
+
+
 	int retval;
 
 	// 클라 정보 얻기
 	SOCKETINFO* ptr = (SOCKETINFO*)lpOverlapped;
+	//
+	if (ptr->isSend) {
+		LARGE_INTEGER c2; QueryPerformanceCounter(&c2);
+		double ioUs = (double)(c2.QuadPart - ptr->sendStart.QuadPart) * 1e6 / g_freq.QuadPart;
+		wprintf(L"WSASend I/O complete: %.3f us (transferred=%lu)\n", ioUs, cbTransferred);
+	}
+
 	SOCKADDR_IN clientaddr;
 	int addrlen = sizeof(clientaddr);
 	getpeername(ptr->sock, (SOCKADDR*)&clientaddr, &addrlen);
@@ -167,8 +184,7 @@ void CALLBACK CompletionRoutine(
 		ptr->sendbytes = 0;
 		// 받은 데이터 출력
 		ptr->buf[ptr->recvbytes / sizeof(wchar_t)] = L'\0';
-		wprintf(L"[TCP/%S:%d] %s\n", inet_ntoa(clientaddr.sin_addr),
-			ntohs(clientaddr.sin_port), ptr->buf);
+		//wprintf(L"[TCP/%S:%d] %s\n", inet_ntoa(clientaddr.sin_addr),ntohs(clientaddr.sin_port), ptr->buf);
 	}
 	else {
 		ptr->sendbytes += cbTransferred;
@@ -180,8 +196,18 @@ void CALLBACK CompletionRoutine(
 		ptr->wsabuf.buf = (char*)ptr->buf + ptr->sendbytes;
 		ptr->wsabuf.len = ptr->recvbytes - ptr->sendbytes;
 
+
+		//
+		ptr->isSend = TRUE;
+		QueryPerformanceCounter(&ptr->sendStart);
+
 		DWORD sendbytes;
 		retval = WSASend(ptr->sock, &ptr->wsabuf, 1, &sendbytes, 0, &ptr->overlapped, CompletionRoutine); // 0반환해서 즉시 카피 확인, 
+		//
+		LARGE_INTEGER c1; QueryPerformanceCounter(&c1);
+		double callUs = (double)(c1.QuadPart - ptr->sendStart.QuadPart) * 1e6 / g_freq.QuadPart;
+		wprintf(L"WSASend call: %.3f us (ret=%d)\n", callUs, retval);
+
 		if (retval == SOCKET_ERROR) {
 			int temp = WSAGetLastError();
 			if (temp != WSA_IO_PENDING) {
@@ -200,6 +226,7 @@ void CALLBACK CompletionRoutine(
 
 		DWORD recvbytes;
 		DWORD flags = 0;
+		ptr->isSend = FALSE;
 		retval = WSARecv(ptr->sock, &ptr->wsabuf, 1, &recvbytes, &flags, &ptr->overlapped, CompletionRoutine); // -1 반환해서 실패했고, pending 됨을 에러로 확인
 		if (retval == SOCKET_ERROR) {
 			int temp = WSAGetLastError();
