@@ -172,6 +172,13 @@ DWORD WINAPI WorkerThread(LPVOID arg) {
 			session->SendWSABuf.len = session->SendQ.DirectDequeueSize();
 			WSASend(session->sock, &session->SendWSABuf, 1, NULL, 0,
 				&session->overlapped.sendOverlapped, NULL);
+
+			// recv 즉시 재등록
+			session->RecvWSABuf.buf = session->RecvQ.GetRearBufferPtr();
+			session->RecvWSABuf.len = session->RecvQ.DirectEnqueueSize();
+			DWORD flags = 0;
+			WSARecv(session->sock, &session->RecvWSABuf, 1, NULL, &flags,
+				&session->overlapped.recvOverlapped, NULL);
 		}
 		else {
 			// send 완료 → sendQ에 남은 데이터 있으면 다시 send
@@ -183,14 +190,7 @@ DWORD WINAPI WorkerThread(LPVOID arg) {
 				WSASend(session->sock, &session->SendWSABuf, 1, NULL, 0,
 					&session->overlapped.sendOverlapped, NULL);
 			}
-			else {
-				// 다 보냈으면 recv 등록
-				session->RecvWSABuf.buf = session->RecvQ.GetRearBufferPtr();
-				session->RecvWSABuf.len = session->RecvQ.DirectEnqueueSize();
-				DWORD flags = 0;
-				WSARecv(session->sock, &session->RecvWSABuf, 1, NULL, &flags,
-					&session->overlapped.recvOverlapped, NULL);
-			}
+
 
 		}
 
