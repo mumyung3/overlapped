@@ -1,6 +1,9 @@
 ﻿#define _WINSOCK_DEPRECATED_NO_WARNINGS
 #pragma comment(lib, "ws2_32")
+#pragma comment(lib, "mswsock.lib") // AcceptEx, DisconnectEx 등
+
 #include <winsock2.h>
+#include <windows.h>
 #include <stdlib.h>
 #include <stdio.h>
 
@@ -10,6 +13,9 @@
 #include <locale.h>  
 #include <conio.h>
 #include "ringbuffer.h"
+#include <map>
+
+SRWLOCK sessionLock = SRWLOCK_INIT;
 struct MYOVERLAPPED {
 
 	OVERLAPPED recvOverlapped;
@@ -26,7 +32,10 @@ struct SOCKETINFO {
 	RingBuffer RecvQ;
 	RingBuffer SendQ;
 	SOCKADDR_IN clientAddr;  // 추가
+	LONG ioCount = 0;
+	bool disconnected = false;
 };
+std::map<__int64, SOCKETINFO*> sessionMap;
 
 DWORD WINAPI WorkerThread(LPVOID arg);
 __int64 GenerateSessionID() {
@@ -41,9 +50,17 @@ struct ACCEPTINFO {
 
 DWORD WINAPI AcceptThread(LPVOID arg);
 
+void PostSend(SOCKETINFO* session);
+void PostRecv(SOCKETINFO* session);
+
+HANDLE hSessionEmpty{};
 int main()
 {
 	_wsetlocale(LC_ALL, L"");  // 시스템 로케일 사용
+
+	//이벤트 생성 세션 전부 제거 대기용
+	hSessionEmpty = CreateEvent(NULL, TRUE, FALSE, NULL);
+
 
 	int retval;
 
@@ -91,7 +108,20 @@ int main()
 			wchar_t ch = _getwch();
 			if (ch == L'q') {
 				// 종료 처리
-				closesocket(listen_sock); // accept 스레드 탈출
+
+				closesocket(listen_sock);
+				AcquireSRWLockExclusive(&sessionLock);
+				for (auto& [id, session] : sessionMap) {
+					closesocket(session->sock);
+				}
+				bool empty = sessionMap.empty();  // ← 락 안에서 체크 
+				ReleaseSRWLockExclusive(&sessionLock);
+
+				if (empty)
+					SetEvent(hSessionEmpty);
+
+				WaitForSingleObject(hSessionEmpty, INFINITE);  // 항상 대기
+
 				threadCount = (int)si.dwNumberOfProcessors * 2;
 				for (int i = 0; i < threadCount; i++)
 					PostQueuedCompletionStatus(hcp, 0, (ULONG_PTR)-1, NULL);
@@ -106,9 +136,10 @@ int main()
 	for (int i = 0; i < threadCount; i++)
 		CloseHandle(hThreads[i]);
 
+	WaitForSingleObject(hAcceptThread, INFINITE);  // ← 추가
+	CloseHandle(hAcceptThread);                     // ← 추가
 
 	CloseHandle(hcp);
-	closesocket(listen_sock);
 	WSACleanup();
 	return 0;
 }
@@ -132,22 +163,44 @@ DWORD WINAPI WorkerThread(LPVOID arg) {
 			return 0;
 		}
 
-		// 오류 처리
+		// 오류 처리 timeout / iocp 자체 실패(이건 고려 x) 
 		if (pov == nullptr) continue;
+
+		LONG remaining = InterlockedDecrement(&session->ioCount);  // ← 추가
+
 
 		// 비동기 입출력 결과확인
 		if (retval == 0 || cbTransferred == 0) {
+			session->disconnected = true;
+
+
+
 			if (retval == 0) {
 				// overlap null이면서 반환값 실패 (io 실패) 연결끊김
 				DWORD temp1, temp2;
 				WSAGetOverlappedResult(session->sock, pov,
 					&temp1, FALSE, &temp2);
-				__debugbreak();
+				//__debugbreak();
 			}
-			closesocket(session->sock);
+			//closesocket(session->sock);
+			//delete session;
+
 			wprintf(L"[TCP 서버] 클라이언트 종료: IP 주소 = %S, 포트 번호=%d\n",
 				inet_ntoa(session->clientAddr.sin_addr), ntohs(session->clientAddr.sin_port));
-			delete session;
+
+			if (remaining == 0) {
+
+				closesocket(session->sock); // 서버 종료시 2번 해제하는거같은데, 실제로 실패반환이면 문제 없는듯?
+				// WorkerThread - delete 직전
+				AcquireSRWLockExclusive(&sessionLock);
+				sessionMap.erase(session->sessionID);
+				bool empty = sessionMap.empty();  // ← 락 안에서 체크
+				ReleaseSRWLockExclusive(&sessionLock);
+				delete session;
+				if (empty)
+					SetEvent(hSessionEmpty);
+			}
+
 			continue;
 		}
 
@@ -170,15 +223,13 @@ DWORD WINAPI WorkerThread(LPVOID arg) {
 			// WSASend 등록
 			session->SendWSABuf.buf = session->SendQ.GetFrontBufferPtr();
 			session->SendWSABuf.len = session->SendQ.DirectDequeueSize();
-			WSASend(session->sock, &session->SendWSABuf, 1, NULL, 0,
-				&session->overlapped.sendOverlapped, NULL);
+			PostSend(session);
 
 			// recv 즉시 재등록
 			session->RecvWSABuf.buf = session->RecvQ.GetRearBufferPtr();
 			session->RecvWSABuf.len = session->RecvQ.DirectEnqueueSize();
 			DWORD flags = 0;
-			WSARecv(session->sock, &session->RecvWSABuf, 1, NULL, &flags,
-				&session->overlapped.recvOverlapped, NULL);
+			PostRecv(session);
 		}
 		else {
 			// send 완료 → sendQ에 남은 데이터 있으면 다시 send
@@ -187,13 +238,24 @@ DWORD WINAPI WorkerThread(LPVOID arg) {
 			if (session->SendQ.GetUseSize() > 0) {
 				session->SendWSABuf.buf = session->SendQ.GetFrontBufferPtr();
 				session->SendWSABuf.len = session->SendQ.DirectDequeueSize();
-				WSASend(session->sock, &session->SendWSABuf, 1, NULL, 0,
-					&session->overlapped.sendOverlapped, NULL);
+				PostSend(session);
 			}
 
 
 		}
 
+
+		if (session->disconnected && remaining == 0) {
+			closesocket(session->sock);
+			// WorkerThread - delete 직전
+			AcquireSRWLockExclusive(&sessionLock);
+			sessionMap.erase(session->sessionID);
+			bool empty = sessionMap.empty();  // ← 락 안에서 체크
+			ReleaseSRWLockExclusive(&sessionLock);
+			delete session;
+			if (empty)
+				SetEvent(hSessionEmpty);
+		}
 	}
 	return 0;
 
@@ -216,6 +278,11 @@ DWORD WINAPI AcceptThread(LPVOID arg) {
 
 		SOCKETINFO* ptr = new SOCKETINFO;
 		ptr->sessionID = GenerateSessionID();
+		// AcceptThread - 추가
+		AcquireSRWLockExclusive(&sessionLock);
+		sessionMap[ptr->sessionID] = ptr;
+		ReleaseSRWLockExclusive(&sessionLock);
+
 		ZeroMemory(&ptr->overlapped, sizeof(ptr->overlapped));
 		ptr->sock = client_sock;
 		ptr->clientAddr = clientaddr;
@@ -225,8 +292,56 @@ DWORD WINAPI AcceptThread(LPVOID arg) {
 		CreateIoCompletionPort((HANDLE)client_sock, info->hcp, (ULONG_PTR)ptr, 0);
 
 		flags = 0;
-		WSARecv(client_sock, &ptr->RecvWSABuf, 1, &recvbytes, &flags,
-			&ptr->overlapped.recvOverlapped, NULL);
+		PostRecv(ptr);
 	}
 	return 0;
+}
+
+void PostRecv(SOCKETINFO* session) {
+	if (session->disconnected) return;
+
+	InterlockedIncrement(&session->ioCount);
+	DWORD flags = 0;
+	if (WSARecv(session->sock, &session->RecvWSABuf, 1, nullptr, &flags, &session->overlapped.recvOverlapped, NULL) == SOCKET_ERROR) {
+		if (WSAGetLastError() != WSA_IO_PENDING) {
+			// 즉 시 실패 -> iocount 되돌리고 종료
+			LONG remaining = InterlockedDecrement(&session->ioCount);
+			session->disconnected = true;
+			if (remaining == 0) {
+				closesocket(session->sock);
+				//  - delete 직전
+				AcquireSRWLockExclusive(&sessionLock);
+				sessionMap.erase(session->sessionID);
+				bool empty = sessionMap.empty();  // ← 락 안에서 체크
+				ReleaseSRWLockExclusive(&sessionLock);
+				delete session;
+				if (empty)
+					SetEvent(hSessionEmpty);
+			}
+		}
+	}
+
+}
+
+void PostSend(SOCKETINFO* session) {
+	if (session->disconnected) return;
+
+	InterlockedIncrement(&session->ioCount);
+	if (WSASend(session->sock, &session->SendWSABuf, 1, nullptr, 0, &session->overlapped.sendOverlapped, nullptr) == SOCKET_ERROR) {
+		if (WSAGetLastError() != WSA_IO_PENDING) {
+			LONG remaining = InterlockedDecrement(&session->ioCount);
+			session->disconnected = true;
+			if (remaining == 0) {
+				closesocket(session->sock);
+				//  - delete 직전
+				AcquireSRWLockExclusive(&sessionLock);
+				sessionMap.erase(session->sessionID);
+				bool empty = sessionMap.empty();  // ← 락 안에서 체크
+				ReleaseSRWLockExclusive(&sessionLock);
+				delete session;
+				if (empty)
+					SetEvent(hSessionEmpty);
+			}
+		}
+	}
 }
