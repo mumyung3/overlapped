@@ -7,7 +7,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 
-#define SERVERPORT 9000
+#define SERVERPORT 6000
 #define MINUSCONCURRENTTHREADS 3
 
 #include <locale.h>  
