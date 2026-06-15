@@ -52,8 +52,22 @@ DWORD WINAPI AcceptThread(LPVOID arg);
 
 void PostSend(SOCKETINFO* session);
 void PostRecv(SOCKETINFO* session);
+bool OnRecv(SOCKETINFO* session);
 
 HANDLE hSessionEmpty{};
+
+#pragma pack(push, 1)
+struct PacketHeader {
+	short len;
+};
+
+struct EchoPacket {
+	PacketHeader header;
+	__int64 data;
+
+};
+#pragma pack(pop)
+
 int main()
 {
 	_wsetlocale(LC_ALL, L"");  // 시스템 로케일 사용
@@ -213,51 +227,24 @@ DWORD WINAPI WorkerThread(LPVOID arg) {
 			continue;
 		}
 
-		// 리턴값 성공!
+		// RECV 완료처리 (gqcs 성공반환)
 		if (pov == &session->overlapped.recvOverlapped) {
+			// recv링버퍼 처리
 			session->RecvQ.MoveRear(cbTransferred);
-			// 받은 데이터 출력
-			// 스택이 너무 커짐. 더미에서 출력을 확인하던 디버깅으로 확인하자!
-			/*/
-			wchar_t tempBuf[BUFSIZE + 1]{};
-			int useSize = session->RecvQ.GetUseSize();
-			session->RecvQ.Peek((char*)tempBuf, useSize);
-			tempBuf[useSize / sizeof(wchar_t)] = L'\0';
-			wprintf(L"[TCP/%S:%d] %s\n",
-				inet_ntoa(session->clientAddr.sin_addr),
-				ntohs(session->clientAddr.sin_port),
-				tempBuf);
-				//*/
 
-				// 에코: recvQ → sendQ 복사
-			int useSize = session->RecvQ.GetUseSize();
-			if (session->SendQ.GetFreeSize() >= useSize) // 버퍼가 부족해서 로직 못돌아가니 사실상 여기가 연결끊기 해야함. 데이터가 안간다면 이쪽부분 따로 로직 나중에 추가하자!
-			{
-				session->RecvQ.Dequeue(session->SendQ.GetRearBufferPtr(), useSize);
-				session->SendQ.MoveRear(useSize);
-			}
-			else // 연결끊기!
-			{
-				session->disconnected = true;
-				LONG remaining = InterlockedDecrement(&session->ioCount);
-				if (remaining == 0) {
-					closesocket(session->sock);
-					AcquireSRWLockExclusive(&sessionLock);
-					sessionMap.erase(session->sessionID);
-					bool empty = sessionMap.empty();
-					ReleaseSRWLockExclusive(&sessionLock);
-					delete session;
-					if (empty) SetEvent(hSessionEmpty);
-				}
-				continue;
+			// 링버퍼 메시지 처리 while
+			while (session->RecvQ.GetUseSize() >= sizeof(PacketHeader)) {
+				PacketHeader header{};
+				session->RecvQ.Peek((char*)&header, sizeof(PacketHeader));
+
+				if (session->RecvQ.GetUseSize() < sizeof(PacketHeader) + header.len)
+					break;
+
+				if (!OnRecv(session)) continue;
+
 			}
 
-			// WSASend 등록
-			if (session->SendQ.GetUseSize() > 0) {
-				session->SendWSABuf.buf = session->SendQ.GetFrontBufferPtr();
-				session->SendWSABuf.len = session->SendQ.DirectDequeueSize();
-				PostSend(session);
-			}
+
 
 			// recv 즉시 재등록
 			session->RecvWSABuf.buf = session->RecvQ.GetRearBufferPtr();
@@ -267,16 +254,19 @@ DWORD WINAPI WorkerThread(LPVOID arg) {
 
 
 		}
+		// SEND 완료 처리
 		else {
+			// SEND QUEUE 정리 
+
 			// send 완료 → sendQ에 남은 데이터 있으면 다시 send
 			session->SendQ.MoveFront(cbTransferred);
-
+			// 남은 데이터 SEND
 			if (session->SendQ.GetUseSize() > 0) {
 				session->SendWSABuf.buf = session->SendQ.GetFrontBufferPtr();
 				session->SendWSABuf.len = session->SendQ.DirectDequeueSize();
 				PostSend(session);
 			}
-
+			// ONSEND 굳이 넣지 않음.
 
 		}
 
@@ -381,4 +371,37 @@ void PostSend(SOCKETINFO* session) {
 			}
 		}
 	}
+}
+
+bool OnRecv(SOCKETINFO* session) {
+	// 에코: recvQ → sendQ 복사
+	int useSize = session->RecvQ.GetUseSize();
+	if (session->SendQ.GetFreeSize() >= useSize) // 버퍼가 부족해서 로직 못돌아가니 사실상 여기가 연결끊기 해야함. 데이터가 안간다면 이쪽부분 따로 로직 나중에 추가하자!
+	{
+		session->RecvQ.Dequeue(session->SendQ.GetRearBufferPtr(), useSize);
+		session->SendQ.MoveRear(useSize);
+	}
+	else // 연결끊기!
+	{
+		session->disconnected = true;
+		LONG remaining = InterlockedDecrement(&session->ioCount);
+		if (remaining == 0) {
+			closesocket(session->sock);
+			AcquireSRWLockExclusive(&sessionLock);
+			sessionMap.erase(session->sessionID);
+			bool empty = sessionMap.empty();
+			ReleaseSRWLockExclusive(&sessionLock);
+			delete session;
+			if (empty) SetEvent(hSessionEmpty);
+		}
+		return false;
+	}
+
+	// WSASend 등록
+	if (session->SendQ.GetUseSize() > 0) {
+		session->SendWSABuf.buf = session->SendQ.GetFrontBufferPtr();
+		session->SendWSABuf.len = session->SendQ.DirectDequeueSize();
+		PostSend(session);
+	}
+	return true;
 }
