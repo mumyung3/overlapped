@@ -21,5 +21,8 @@
     <ClCompile Include="..\..\..\..\03procademy(2코스)\00과제\링버퍼\RingBuffer\RingBuffer\ringbuffer.cpp">
       <Filter>소스 파일</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\..\..\03procademy(2코스)\00과제\직렬화버퍼\Serialization\Serialization\Serialization.cpp">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
   </ItemGroup>
 </Project>

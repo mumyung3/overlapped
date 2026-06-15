@@ -13,6 +13,7 @@
 #include <locale.h>  
 #include <conio.h>
 #include "ringbuffer.h"
+#include "Serialization.h"
 #include <map>
 
 SRWLOCK sessionLock = SRWLOCK_INIT;
@@ -52,9 +53,7 @@ DWORD WINAPI AcceptThread(LPVOID arg);
 
 void PostSend(SOCKETINFO* session);
 void PostRecv(SOCKETINFO* session);
-bool OnRecv(SOCKETINFO* session);
-
-HANDLE hSessionEmpty{};
+bool OnRecv(SOCKETINFO* session, CPacket& packet);
 
 #pragma pack(push, 1)
 struct PacketHeader {
@@ -67,6 +66,35 @@ struct EchoPacket {
 
 };
 #pragma pack(pop)
+
+
+CPacket& operator<<(CPacket& packet, const EchoPacket& byValue) {
+
+#ifdef DEBUG_SERIALIZE
+	swprintf_s(g_function, sizeof(g_function) / sizeof(wchar_t), L"%S", __FUNCTION__);
+#endif
+
+	if (packet.GetRemainSize() < sizeof(byValue)) { packet.bError = true; return packet; }
+	memcpy(packet.buffer + packet.rear, &byValue, sizeof(byValue));
+	packet.rear += sizeof(byValue);
+	return packet;
+}
+
+CPacket& operator>>(CPacket& packet, EchoPacket& byValue) {
+
+#ifdef DEBUG_SERIALIZE
+	swprintf_s(g_function, sizeof(g_function) / sizeof(wchar_t), L"%S", __FUNCTION__);
+#endif
+
+	if (packet.GetUseSize() < sizeof(byValue)) { packet.bError = true; return packet; }
+	memcpy(&byValue, packet.buffer + packet.front, sizeof(byValue));
+	packet.front += sizeof(byValue);
+	return packet;
+}
+
+
+HANDLE hSessionEmpty{};
+
 
 int main()
 {
@@ -232,6 +260,8 @@ DWORD WINAPI WorkerThread(LPVOID arg) {
 			// recv링버퍼 처리
 			session->RecvQ.MoveRear(cbTransferred);
 
+			bool sessionAlive = true;
+
 			// 링버퍼 메시지 처리 while
 			while (session->RecvQ.GetUseSize() >= sizeof(PacketHeader)) {
 				PacketHeader header{};
@@ -240,18 +270,24 @@ DWORD WINAPI WorkerThread(LPVOID arg) {
 				if (session->RecvQ.GetUseSize() < sizeof(PacketHeader) + header.len)
 					break;
 
-				if (!OnRecv(session)) continue;
+				CPacket packet{};
+				session->RecvQ.Dequeue(packet.GetBufferPtr() + packet.rear, sizeof(EchoPacket));
+				packet.MoveWritePos(sizeof(EchoPacket));
+				if (!OnRecv(session, packet)) {
+					sessionAlive = false;
+					break;
+				}
 
 			}
 
+			if (sessionAlive) {
 
-
-			// recv 즉시 재등록
-			session->RecvWSABuf.buf = session->RecvQ.GetRearBufferPtr();
-			session->RecvWSABuf.len = session->RecvQ.DirectEnqueueSize();
-			DWORD flags = 0;
-			PostRecv(session);
-
+				// recv 즉시 재등록
+				session->RecvWSABuf.buf = session->RecvQ.GetRearBufferPtr();
+				session->RecvWSABuf.len = session->RecvQ.DirectEnqueueSize();
+				DWORD flags = 0;
+				PostRecv(session);
+			}
 
 		}
 		// SEND 완료 처리
@@ -373,27 +409,28 @@ void PostSend(SOCKETINFO* session) {
 	}
 }
 
-bool OnRecv(SOCKETINFO* session) {
-	// 에코: recvQ → sendQ 복사
-	int useSize = session->RecvQ.GetUseSize();
+bool OnRecv(SOCKETINFO* session, CPacket& packet) {
+
+	EchoPacket echoPacket{};
+	// 역직렬화 (구조체화)
+	packet >> echoPacket;
+
+	// 컨텐츠 로직 했다 치고.
+
+	// 직렬화 (바이트화)
+	CPacket sendPacket{};
+	sendPacket << echoPacket;
+
+	// sendq 넣기
+
+	int useSize = sendPacket.GetUseSize();
 	if (session->SendQ.GetFreeSize() >= useSize) // 버퍼가 부족해서 로직 못돌아가니 사실상 여기가 연결끊기 해야함. 데이터가 안간다면 이쪽부분 따로 로직 나중에 추가하자!
 	{
-		session->RecvQ.Dequeue(session->SendQ.GetRearBufferPtr(), useSize);
-		session->SendQ.MoveRear(useSize);
+		session->SendQ.Enqueue((char*)sendPacket.GetBufferPtr() + sendPacket.front, useSize);
 	}
 	else // 연결끊기!
 	{
 		session->disconnected = true;
-		LONG remaining = InterlockedDecrement(&session->ioCount);
-		if (remaining == 0) {
-			closesocket(session->sock);
-			AcquireSRWLockExclusive(&sessionLock);
-			sessionMap.erase(session->sessionID);
-			bool empty = sessionMap.empty();
-			ReleaseSRWLockExclusive(&sessionLock);
-			delete session;
-			if (empty) SetEvent(hSessionEmpty);
-		}
 		return false;
 	}
 
