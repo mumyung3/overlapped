@@ -287,18 +287,26 @@ DWORD WINAPI WorkerThread(LPVOID arg) {
 			// SEND QUEUE 스레드가 동시 접근 방지 락
 			AcquireSRWLockExclusive(&session->sendQLock);
 
+			// send 쪽에서 보낸 데이터 로그 한번 찍어보기
+			char* temp = new char[cbTransferred + 2];
+			memcpy(temp, session->SendQ.GetFrontBufferPtr(), cbTransferred);
+			wchar_t* text = (wchar_t*)temp;
+			text[cbTransferred / 2] = L'\0';
+			wprintf(L"보낸 데이터 : %s\n", text);
+			delete[] temp;
+
 			// send 완료 → sendQ에 남은 데이터 있으면 다시 send
 			session->SendQ.MoveFront(cbTransferred);
 
 			// sendflag 해제
 			InterlockedExchange(&session->sendFlag, 0);
+			ReleaseSRWLockExclusive(&session->sendQLock);
+
 
 			// 남은 데이터 SEND
-			if (session->SendQ.GetUseSize() > 0) {
-				PostSend(session);
-			}
+			PostSend(session);
+
 			// ONSEND 굳이 넣지 않음.
-			ReleaseSRWLockExclusive(&session->sendQLock);
 
 		}
 
@@ -365,19 +373,31 @@ void PostRecv(SOCKETINFO* session) {
 void PostSend(SOCKETINFO* session) {
 	if (session->disconnected) return;
 
+
 	// sendflag 이전 값 1 이면 리턴
 	if (InterlockedExchange(&session->sendFlag, 1) == 1) return;
 
+	AcquireSRWLockExclusive(&session->sendQLock);
+	if (session->SendQ.GetUseSize() <= 0) {
+		InterlockedExchange(&session->sendFlag, 0);  // 해제하고 return
+		ReleaseSRWLockExclusive(&session->sendQLock); // 락 릭 대응
+		return;
+	}
 	session->SendWSABuf.buf = session->SendQ.GetFrontBufferPtr();
 	session->SendWSABuf.len = session->SendQ.DirectDequeueSize();
+	ReleaseSRWLockExclusive(&session->sendQLock);
+
 
 	InterlockedIncrement(&session->ioCount);
 	if (WSASend(session->sock, &session->SendWSABuf, 1, nullptr, 0, &session->overlapped.sendOverlapped, nullptr) == SOCKET_ERROR) {
 		if (WSAGetLastError() != WSA_IO_PENDING) {
+			InterlockedExchange(&session->sendFlag, 0);
 			session->disconnected = true;
 			TryCloseSession(session);
 		}
 	}
+
+
 }
 
 bool OnRecv(SOCKETINFO* session, CPacket& packet) {
@@ -407,14 +427,10 @@ bool OnRecv(SOCKETINFO* session, CPacket& packet) {
 		ReleaseSRWLockExclusive(&session->sendQLock);
 		return false;
 	}
-
-
+	ReleaseSRWLockExclusive(&session->sendQLock);
 
 	// WSASend 등록
-	if (session->SendQ.GetUseSize() > 0) {
-		PostSend(session);
-	}
-	ReleaseSRWLockExclusive(&session->sendQLock);
+	PostSend(session);
 
 	return true;
 }
