@@ -7,7 +7,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 
-#define SERVERPORT 6000
+#define SERVERPORT 9000
 #define MINUSCONCURRENTTHREADS 3
 
 #include <locale.h>  
@@ -35,6 +35,8 @@ struct SOCKETINFO {
 	SOCKADDR_IN clientAddr{};  // 추가
 	LONG ioCount = 0;
 	bool disconnected = false;
+	LONG sendFlag = 0;
+	SRWLOCK sendQLock = SRWLOCK_INIT;
 };
 std::map<__int64, SOCKETINFO*> sessionMap;
 
@@ -160,6 +162,7 @@ int main()
 				closesocket(listen_sock);
 				AcquireSRWLockExclusive(&sessionLock);
 				for (auto& [id, session] : sessionMap) {
+					session->disconnected = true;
 					closesocket(session->sock);
 				}
 				bool empty = sessionMap.empty();  // ← 락 안에서 체크 
@@ -281,15 +284,21 @@ DWORD WINAPI WorkerThread(LPVOID arg) {
 		else {
 			// SEND QUEUE 정리 
 
+			// SEND QUEUE 스레드가 동시 접근 방지 락
+			AcquireSRWLockExclusive(&session->sendQLock);
+
 			// send 완료 → sendQ에 남은 데이터 있으면 다시 send
 			session->SendQ.MoveFront(cbTransferred);
+
+			// sendflag 해제
+			InterlockedExchange(&session->sendFlag, 0);
+
 			// 남은 데이터 SEND
 			if (session->SendQ.GetUseSize() > 0) {
-				session->SendWSABuf.buf = session->SendQ.GetFrontBufferPtr();
-				session->SendWSABuf.len = session->SendQ.DirectDequeueSize();
 				PostSend(session);
 			}
 			// ONSEND 굳이 넣지 않음.
+			ReleaseSRWLockExclusive(&session->sendQLock);
 
 		}
 
@@ -356,6 +365,12 @@ void PostRecv(SOCKETINFO* session) {
 void PostSend(SOCKETINFO* session) {
 	if (session->disconnected) return;
 
+	// sendflag 이전 값 1 이면 리턴
+	if (InterlockedExchange(&session->sendFlag, 1) == 1) return;
+
+	session->SendWSABuf.buf = session->SendQ.GetFrontBufferPtr();
+	session->SendWSABuf.len = session->SendQ.DirectDequeueSize();
+
 	InterlockedIncrement(&session->ioCount);
 	if (WSASend(session->sock, &session->SendWSABuf, 1, nullptr, 0, &session->overlapped.sendOverlapped, nullptr) == SOCKET_ERROR) {
 		if (WSAGetLastError() != WSA_IO_PENDING) {
@@ -378,6 +393,7 @@ bool OnRecv(SOCKETINFO* session, CPacket& packet) {
 	sendPacket << echoPacket;
 
 	// sendq 넣기
+	AcquireSRWLockExclusive(&session->sendQLock);
 
 	int useSize = sendPacket.GetUseSize();
 	if (session->SendQ.GetFreeSize() >= useSize) // 버퍼가 부족해서 로직 못돌아가니 사실상 여기가 연결끊기 해야함. 데이터가 안간다면 이쪽부분 따로 로직 나중에 추가하자!
@@ -387,15 +403,19 @@ bool OnRecv(SOCKETINFO* session, CPacket& packet) {
 	else // 연결끊기!
 	{
 		session->disconnected = true;
+		// 락 릭 대응
+		ReleaseSRWLockExclusive(&session->sendQLock);
 		return false;
 	}
 
+
+
 	// WSASend 등록
 	if (session->SendQ.GetUseSize() > 0) {
-		session->SendWSABuf.buf = session->SendQ.GetFrontBufferPtr();
-		session->SendWSABuf.len = session->SendQ.DirectDequeueSize();
 		PostSend(session);
 	}
+	ReleaseSRWLockExclusive(&session->sendQLock);
+
 	return true;
 }
 
