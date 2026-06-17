@@ -34,7 +34,7 @@ struct SOCKETINFO {
 	RingBuffer SendQ{};
 	SOCKADDR_IN clientAddr{};  // 추가
 	LONG ioCount = 0;
-	bool disconnected = false;
+	LONG disconnected = 0;
 	LONG sendFlag = 0;
 	SRWLOCK sendQLock = SRWLOCK_INIT;
 };
@@ -57,6 +57,7 @@ void PostSend(SOCKETINFO* session);
 void PostRecv(SOCKETINFO* session);
 bool OnRecv(SOCKETINFO* session, CPacket& packet);
 void TryCloseSession(SOCKETINFO* session);
+bool SendPacket(__int64 sessionID, CPacket& packet);
 
 #pragma pack(push, 1)
 struct PacketHeader {
@@ -162,7 +163,7 @@ int main()
 				closesocket(listen_sock);
 				AcquireSRWLockExclusive(&sessionLock);
 				for (auto& [id, session] : sessionMap) {
-					session->disconnected = true;
+					InterlockedExchange(&session->disconnected, 1);  // 쓰기
 					closesocket(session->sock);
 				}
 				bool empty = sessionMap.empty();  // ← 락 안에서 체크 
@@ -225,7 +226,7 @@ DWORD WINAPI WorkerThread(LPVOID arg) {
 
 		// 비동기 입출력 결과확인
 		if (retval == 0 || cbTransferred == 0) {
-			session->disconnected = true;
+			InterlockedExchange(&session->disconnected, 1);  // 쓰기
 
 			// 리턴 false에 pov 널이 아닐때, (io 실패) -> transfer = 0, key = session 포인터 pov = 해당 overlap 설정됨.
 			if (retval == 0) {
@@ -280,7 +281,7 @@ DWORD WINAPI WorkerThread(LPVOID arg) {
 			}
 
 		}
-		// SEND 완료 처리
+		// SEND 완료 처리 (send 완료 처리랑 sendpacket은 다른듯함. sendpacket은 외부에서 이 데이터 보내줘 요청 send q 인큐 -> postsend() )
 		else {
 			// SEND QUEUE 정리 
 
@@ -310,7 +311,7 @@ DWORD WINAPI WorkerThread(LPVOID arg) {
 
 		}
 
-		if (session->disconnected)
+		if (InterlockedOr(&session->disconnected, 0))
 			TryCloseSession(session);
 		else
 			InterlockedDecrement(&session->ioCount);
@@ -356,14 +357,14 @@ DWORD WINAPI AcceptThread(LPVOID arg) {
 }
 
 void PostRecv(SOCKETINFO* session) {
-	if (session->disconnected) return;
+	if (InterlockedOr(&session->disconnected, 0)) return;
 
 	InterlockedIncrement(&session->ioCount);
 	DWORD flags = 0;
 	if (WSARecv(session->sock, &session->RecvWSABuf, 1, nullptr, &flags, &session->overlapped.recvOverlapped, NULL) == SOCKET_ERROR) {
 		if (WSAGetLastError() != WSA_IO_PENDING) {
 			// 즉 시 실패 -> iocount 되돌리고 종료
-			session->disconnected = true;
+			InterlockedExchange(&session->disconnected, 1);  // 쓰기
 			TryCloseSession(session);
 		}
 	}
@@ -371,7 +372,7 @@ void PostRecv(SOCKETINFO* session) {
 }
 
 void PostSend(SOCKETINFO* session) {
-	if (session->disconnected) return;
+	if (InterlockedOr(&session->disconnected, 0))  return;
 
 
 	// sendflag 이전 값 1 이면 리턴
@@ -392,7 +393,7 @@ void PostSend(SOCKETINFO* session) {
 	if (WSASend(session->sock, &session->SendWSABuf, 1, nullptr, 0, &session->overlapped.sendOverlapped, nullptr) == SOCKET_ERROR) {
 		if (WSAGetLastError() != WSA_IO_PENDING) {
 			InterlockedExchange(&session->sendFlag, 0);
-			session->disconnected = true;
+			InterlockedExchange(&session->disconnected, 1);  // 쓰기
 			TryCloseSession(session);
 		}
 	}
@@ -412,27 +413,7 @@ bool OnRecv(SOCKETINFO* session, CPacket& packet) {
 	CPacket sendPacket{};
 	sendPacket << echoPacket;
 
-	// sendq 넣기
-	AcquireSRWLockExclusive(&session->sendQLock);
-
-	int useSize = sendPacket.GetUseSize();
-	if (session->SendQ.GetFreeSize() >= useSize) // 버퍼가 부족해서 로직 못돌아가니 사실상 여기가 연결끊기 해야함. 데이터가 안간다면 이쪽부분 따로 로직 나중에 추가하자!
-	{
-		session->SendQ.Enqueue((char*)sendPacket.GetBufferPtr() + sendPacket.front, useSize);
-	}
-	else // 연결끊기!
-	{
-		session->disconnected = true;
-		// 락 릭 대응
-		ReleaseSRWLockExclusive(&session->sendQLock);
-		return false;
-	}
-	ReleaseSRWLockExclusive(&session->sendQLock);
-
-	// WSASend 등록
-	PostSend(session);
-
-	return true;
+	return SendPacket(session->sessionID, sendPacket);
 }
 
 void TryCloseSession(SOCKETINFO* session) {
@@ -448,4 +429,38 @@ void TryCloseSession(SOCKETINFO* session) {
 		if (empty)
 			SetEvent(hSessionEmpty);
 	}
+}
+
+bool SendPacket(__int64 sessionID, CPacket& packet) {
+
+	// sessionId로 ptr 가져오기
+	AcquireSRWLockExclusive(&sessionLock);
+	auto it = sessionMap.find(sessionID);
+	if (it == sessionMap.end()) {
+		ReleaseSRWLockExclusive(&sessionLock);
+		return false;
+	}
+	SOCKETINFO* session = it->second;
+	ReleaseSRWLockExclusive(&sessionLock);
+
+	// sendq 넣기
+	AcquireSRWLockExclusive(&session->sendQLock);
+
+	int useSize = packet.GetUseSize();
+	if (session->SendQ.GetFreeSize() >= useSize) // 버퍼가 부족해서 로직 못돌아가니 사실상 여기가 연결끊기 해야함. 데이터가 안간다면 이쪽부분 따로 로직 나중에 추가하자!
+	{
+		session->SendQ.Enqueue((char*)packet.GetBufferPtr() + packet.front, useSize);
+	}
+	else // 연결끊기!
+	{
+		InterlockedExchange(&session->disconnected, 1);  // 쓰기
+		// 락 릭 대응
+		ReleaseSRWLockExclusive(&session->sendQLock);
+		return false;
+	}
+	ReleaseSRWLockExclusive(&session->sendQLock);
+
+	// WSASend 등록
+	PostSend(session);
+	return true;
 }
