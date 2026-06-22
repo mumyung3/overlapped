@@ -7,7 +7,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 
-#define SERVERPORT 9000
+#define SERVERPORT 6000
 #define MINUSCONCURRENTTHREADS 3
 
 #include <locale.h>  
@@ -36,7 +36,7 @@ struct SOCKETINFO {
 	LONG ioCount = 0;
 	LONG disconnected = 0;
 	LONG sendFlag = 0;
-	SRWLOCK sendQLock = SRWLOCK_INIT;
+	SRWLOCK sessionLock = SRWLOCK_INIT; // 샌드큐 락을 세션락으로 변경
 };
 std::map<__int64, SOCKETINFO*> sessionMap;
 
@@ -58,7 +58,7 @@ void PostRecv(SOCKETINFO* session);
 bool OnRecv(SOCKETINFO* session, CPacket& packet);
 void TryCloseSession(SOCKETINFO* session);
 bool SendPacket(__int64 sessionID, CPacket& packet);
-
+bool SendPacket_NoLock(__int64 sessionID, CPacket& packet);
 #pragma pack(push, 1)
 struct PacketHeader {
 	short len;
@@ -217,11 +217,17 @@ DWORD WINAPI WorkerThread(LPVOID arg) {
 		if (completionKey == (ULONG_PTR)-1) {
 			return 0;
 		}
+
 		session = (SOCKETINFO*)completionKey;  // 여기서 캐스팅
+		// session에 대한 전체 락
+		AcquireSRWLockExclusive(&session->sessionLock);
+
 
 		// 오류 처리 timeout / iocp 자체 실패(이건 고려 x) 
-		if (retval == 0 && pov == nullptr) continue;
-
+		if (retval == 0 && pov == nullptr) {
+			ReleaseSRWLockExclusive(&session->sessionLock);
+			continue;
+		}
 
 
 		// 비동기 입출력 결과확인
@@ -286,14 +292,13 @@ DWORD WINAPI WorkerThread(LPVOID arg) {
 			// SEND QUEUE 정리 
 
 			// SEND QUEUE 스레드가 동시 접근 방지 락
-			AcquireSRWLockExclusive(&session->sendQLock);
+			//AcquireSRWLockExclusive(&session->sendQLock);
 
 			// send 쪽에서 보낸 데이터 로그 한번 찍어보기
-			char* temp = new char[cbTransferred + 2];
+			char* temp = new char[cbTransferred];
 			memcpy(temp, session->SendQ.GetFrontBufferPtr(), cbTransferred);
-			wchar_t* text = (wchar_t*)temp;
-			text[cbTransferred / 2] = L'\0';
-			wprintf(L"보낸 데이터 : %s\n", text);
+			__int64* tempp = (__int64*)(temp + 2);
+			wprintf(L"보낸 데이터 : %p\n", (__int64*)*tempp);
 			delete[] temp;
 
 			// send 완료 → sendQ에 남은 데이터 있으면 다시 send
@@ -301,7 +306,7 @@ DWORD WINAPI WorkerThread(LPVOID arg) {
 
 			// sendflag 해제
 			InterlockedExchange(&session->sendFlag, 0);
-			ReleaseSRWLockExclusive(&session->sendQLock);
+			//ReleaseSRWLockExclusive(&session->sendQLock);
 
 
 			// 남은 데이터 SEND
@@ -315,6 +320,10 @@ DWORD WINAPI WorkerThread(LPVOID arg) {
 			TryCloseSession(session);
 		else
 			InterlockedDecrement(&session->ioCount);
+
+
+		// session에 대한 전체 락
+		ReleaseSRWLockExclusive(&session->sessionLock);
 	}
 	return 0;
 
@@ -370,7 +379,7 @@ void PostRecv(SOCKETINFO* session) {
 	}
 
 }
-
+// postsend를 호출하는 함수들이 이미 세션 락을 걸어줌을 전제
 void PostSend(SOCKETINFO* session) {
 	if (InterlockedOr(&session->disconnected, 0))  return;
 
@@ -378,15 +387,15 @@ void PostSend(SOCKETINFO* session) {
 	// sendflag 이전 값 1 이면 리턴
 	if (InterlockedExchange(&session->sendFlag, 1) == 1) return;
 
-	AcquireSRWLockExclusive(&session->sendQLock);
+	//AcquireSRWLockExclusive(&session->sendQLock);
 	if (session->SendQ.GetUseSize() <= 0) {
 		InterlockedExchange(&session->sendFlag, 0);  // 해제하고 return
-		ReleaseSRWLockExclusive(&session->sendQLock); // 락 릭 대응
+		//ReleaseSRWLockExclusive(&session->sendQLock); // 락 릭 대응
 		return;
 	}
 	session->SendWSABuf.buf = session->SendQ.GetFrontBufferPtr();
 	session->SendWSABuf.len = session->SendQ.DirectDequeueSize();
-	ReleaseSRWLockExclusive(&session->sendQLock);
+	//ReleaseSRWLockExclusive(&session->sendQLock);
 
 
 	InterlockedIncrement(&session->ioCount);
@@ -413,7 +422,7 @@ bool OnRecv(SOCKETINFO* session, CPacket& packet) {
 	CPacket sendPacket{};
 	sendPacket << echoPacket;
 
-	return SendPacket(session->sessionID, sendPacket);
+	return SendPacket_NoLock(session->sessionID, sendPacket);
 }
 
 void TryCloseSession(SOCKETINFO* session) {
@@ -444,7 +453,9 @@ bool SendPacket(__int64 sessionID, CPacket& packet) {
 	ReleaseSRWLockExclusive(&sessionLock);
 
 	// sendq 넣기
-	AcquireSRWLockExclusive(&session->sendQLock);
+	//AcquireSRWLockExclusive(&session->sendQLock);
+	AcquireSRWLockExclusive(&session->sessionLock);
+
 
 	int useSize = packet.GetUseSize();
 	if (session->SendQ.GetFreeSize() >= useSize) // 버퍼가 부족해서 로직 못돌아가니 사실상 여기가 연결끊기 해야함. 데이터가 안간다면 이쪽부분 따로 로직 나중에 추가하자!
@@ -455,12 +466,57 @@ bool SendPacket(__int64 sessionID, CPacket& packet) {
 	{
 		InterlockedExchange(&session->disconnected, 1);  // 쓰기
 		// 락 릭 대응
-		ReleaseSRWLockExclusive(&session->sendQLock);
+		//ReleaseSRWLockExclusive(&session->sendQLock);
+		ReleaseSRWLockExclusive(&session->sessionLock);
 		return false;
 	}
-	ReleaseSRWLockExclusive(&session->sendQLock);
+	//ReleaseSRWLockExclusive(&session->sendQLock);
 
 	// WSASend 등록
 	PostSend(session);
+
+	ReleaseSRWLockExclusive(&session->sessionLock);
+
 	return true;
 }
+
+
+bool SendPacket_NoLock(__int64 sessionID, CPacket& packet) {
+
+	// sessionId로 ptr 가져오기
+	AcquireSRWLockExclusive(&sessionLock);
+	auto it = sessionMap.find(sessionID);
+	if (it == sessionMap.end()) {
+		ReleaseSRWLockExclusive(&sessionLock);
+		return false;
+	}
+	SOCKETINFO* session = it->second;
+	ReleaseSRWLockExclusive(&sessionLock);
+
+	// sendq 넣기
+	//AcquireSRWLockExclusive(&session->sendQLock);
+	//AcquireSRWLockExclusive(&session->sessionLock);
+
+
+	int useSize = packet.GetUseSize();
+	if (session->SendQ.GetFreeSize() >= useSize) // 버퍼가 부족해서 로직 못돌아가니 사실상 여기가 연결끊기 해야함. 데이터가 안간다면 이쪽부분 따로 로직 나중에 추가하자!
+	{
+		session->SendQ.Enqueue((char*)packet.GetBufferPtr() + packet.front, useSize);
+	}
+	else // 연결끊기!
+	{
+		InterlockedExchange(&session->disconnected, 1);  // 쓰기
+		// 락 릭 대응
+		//ReleaseSRWLockExclusive(&session->sendQLock);
+		return false;
+	}
+	//ReleaseSRWLockExclusive(&session->sendQLock);
+
+	// WSASend 등록
+	PostSend(session);
+
+	//ReleaseSRWLockExclusive(&session->sessionLock);
+
+	return true;
+}
+
