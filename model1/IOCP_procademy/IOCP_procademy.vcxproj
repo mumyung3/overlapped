@@ -76,6 +76,8 @@
       <SDLCheck>true</SDLCheck>
       <PreprocessorDefinitions>WIN32;_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <AdditionalIncludeDirectories>D:\03procademy(2코스)\00과제\링버퍼\RingBuffer\RingBuffer;D:\03procademy(2코스)\00과제\직렬화버퍼\Serialization\Serialization</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -90,7 +92,8 @@
       <SDLCheck>true</SDLCheck>
       <PreprocessorDefinitions>WIN32;NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
-      <AdditionalIncludeDirectories>D:\03procademy(2코스)\00과제\링버퍼\RingBuffer\RingBuffer</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>D:\03procademy(2코스)\00과제\링버퍼\RingBuffer\RingBuffer;D:\03procademy(2코스)\00과제\직렬화버퍼\Serialization\Serialization</AdditionalIncludeDirectories>
+      <LanguageStandard>stdcpp17</LanguageStandard>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>

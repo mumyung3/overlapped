@@ -249,6 +249,8 @@ DWORD WINAPI WorkerThread(LPVOID arg) {
 				inet_ntoa(session->clientAddr.sin_addr), ntohs(session->clientAddr.sin_port));
 
 			TryCloseSession(session);
+			// session에 대한 전체 락
+			ReleaseSRWLockExclusive(&session->sessionLock);
 			continue;
 		}
 
@@ -424,7 +426,7 @@ bool OnRecv(SOCKETINFO* session, CPacket& packet) {
 
 	return SendPacket_NoLock(session->sessionID, sendPacket);
 }
-
+// 릴리즈 세션 함수 부분
 void TryCloseSession(SOCKETINFO* session) {
 	LONG remaining = InterlockedDecrement(&session->ioCount);
 	if (remaining == 0) {
