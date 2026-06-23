@@ -219,13 +219,10 @@ DWORD WINAPI WorkerThread(LPVOID arg) {
 		}
 
 		session = (SOCKETINFO*)completionKey;  // 여기서 캐스팅
-		// session에 대한 전체 락
-		AcquireSRWLockExclusive(&session->sessionLock);
 
 
 		// 오류 처리 timeout / iocp 자체 실패(이건 고려 x) 
 		if (retval == 0 && pov == nullptr) {
-			ReleaseSRWLockExclusive(&session->sessionLock);
 			continue;
 		}
 
@@ -249,8 +246,6 @@ DWORD WINAPI WorkerThread(LPVOID arg) {
 				inet_ntoa(session->clientAddr.sin_addr), ntohs(session->clientAddr.sin_port));
 
 			TryCloseSession(session);
-			// session에 대한 전체 락
-			ReleaseSRWLockExclusive(&session->sessionLock);
 			continue;
 		}
 
@@ -295,6 +290,7 @@ DWORD WINAPI WorkerThread(LPVOID arg) {
 
 			// SEND QUEUE 스레드가 동시 접근 방지 락
 			//AcquireSRWLockExclusive(&session->sendQLock);
+			AcquireSRWLockExclusive(&session->sessionLock);
 
 			// send 쪽에서 보낸 데이터 로그 한번 찍어보기
 			char* temp = new char[cbTransferred];
@@ -313,6 +309,7 @@ DWORD WINAPI WorkerThread(LPVOID arg) {
 
 			// 남은 데이터 SEND
 			PostSend(session);
+			ReleaseSRWLockExclusive(&session->sessionLock);
 
 			// ONSEND 굳이 넣지 않음.
 
@@ -324,8 +321,6 @@ DWORD WINAPI WorkerThread(LPVOID arg) {
 			InterlockedDecrement(&session->ioCount);
 
 
-		// session에 대한 전체 락
-		ReleaseSRWLockExclusive(&session->sessionLock);
 	}
 	return 0;
 
@@ -389,7 +384,9 @@ void PostSend(SOCKETINFO* session) {
 	// sendflag 이전 값 1 이면 리턴
 	if (InterlockedExchange(&session->sendFlag, 1) == 1) return;
 
+
 	//AcquireSRWLockExclusive(&session->sendQLock);
+
 	if (session->SendQ.GetUseSize() <= 0) {
 		InterlockedExchange(&session->sendFlag, 0);  // 해제하고 return
 		//ReleaseSRWLockExclusive(&session->sendQLock); // 락 릭 대응
@@ -398,7 +395,6 @@ void PostSend(SOCKETINFO* session) {
 	session->SendWSABuf.buf = session->SendQ.GetFrontBufferPtr();
 	session->SendWSABuf.len = session->SendQ.DirectDequeueSize();
 	//ReleaseSRWLockExclusive(&session->sendQLock);
-
 
 	InterlockedIncrement(&session->ioCount);
 	if (WSASend(session->sock, &session->SendWSABuf, 1, nullptr, 0, &session->overlapped.sendOverlapped, nullptr) == SOCKET_ERROR) {
@@ -424,7 +420,7 @@ bool OnRecv(SOCKETINFO* session, CPacket& packet) {
 	CPacket sendPacket{};
 	sendPacket << echoPacket;
 
-	return SendPacket_NoLock(session->sessionID, sendPacket);
+	return SendPacket(session->sessionID, sendPacket);
 }
 // 릴리즈 세션 함수 부분
 void TryCloseSession(SOCKETINFO* session) {
@@ -436,7 +432,12 @@ void TryCloseSession(SOCKETINFO* session) {
 		sessionMap.erase(session->sessionID);
 		bool empty = sessionMap.empty();  // ← 락 안에서 체크
 		ReleaseSRWLockExclusive(&sessionLock);
+
+		AcquireSRWLockExclusive(&session->sessionLock);
+		// 내가 마지막인가? 확인하는 락 기능이 다름.
 		delete session;
+		ReleaseSRWLockExclusive(&session->sessionLock);
+
 		if (empty)
 			SetEvent(hSessionEmpty);
 	}
@@ -482,7 +483,7 @@ bool SendPacket(__int64 sessionID, CPacket& packet) {
 	return true;
 }
 
-
+// 다시 안쓰는 코드가 됨 ㅋㅋ..
 bool SendPacket_NoLock(__int64 sessionID, CPacket& packet) {
 
 	// sessionId로 ptr 가져오기
