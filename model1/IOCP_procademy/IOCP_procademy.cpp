@@ -431,12 +431,13 @@ void TryCloseSession(SOCKETINFO* session) {
 		AcquireSRWLockExclusive(&sessionLock);
 		sessionMap.erase(session->sessionID);
 		bool empty = sessionMap.empty();  // ← 락 안에서 체크
-		ReleaseSRWLockExclusive(&sessionLock);
 
 		AcquireSRWLockExclusive(&session->sessionLock);
-		// 내가 마지막인가? 확인하는 락 기능이 다름.
-		delete session;
+		ReleaseSRWLockExclusive(&sessionLock);
+
+		// 내가 마지막인가? 확인하는 락 기능이 다름. 
 		ReleaseSRWLockExclusive(&session->sessionLock);
+		delete session; // 실제로 로직 스레드 만들어서 테스트 해보기.
 
 		if (empty)
 			SetEvent(hSessionEmpty);
@@ -453,11 +454,12 @@ bool SendPacket(__int64 sessionID, CPacket& packet) {
 		return false;
 	}
 	SOCKETINFO* session = it->second;
+	AcquireSRWLockExclusive(&session->sessionLock);
+
 	ReleaseSRWLockExclusive(&sessionLock);
 
 	// sendq 넣기
 	//AcquireSRWLockExclusive(&session->sendQLock);
-	AcquireSRWLockExclusive(&session->sessionLock);
 
 
 	int useSize = packet.GetUseSize();
